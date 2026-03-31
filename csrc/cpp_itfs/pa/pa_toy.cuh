@@ -62,6 +62,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
     constexpr int NWARPS          = NUM_THREADS / WARP_SIZE;
     constexpr int TOKENS_PER_WARP = T_PAR_SIZE / NWARPS;
     constexpr int TLOOP           = TOKENS_PER_WARP / 16;
+    constexpr int vectorize_size  = CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
     const auto warpid   = thread_idx / WARP_SIZE;
     const auto laneid   = thread_idx % WARP_SIZE;
@@ -101,6 +102,9 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
     // load k -> reg && Q*K
     _B16x8 Klocal[TLOOP][QKHELOOP] = {};
     floatx4 d_out[TLOOP] = {};
+    float d_out_max[TLOOP] = -FLT_MAX;
+    float score_max = -FLT_MAX;
+
     constexpr int K_VEC_SIZE = CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
@@ -132,66 +136,94 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
             }
         }
         d_out[token_depth] *= scale;
+
+        for (int i = 0; i < 4; i++) {
+            d_out_max[token_depth] = fmaxf(d_out_max[token_depth], d_out[token_depth][i]);
+        }
+        for (int mask = QKHE_PER_FETCH; mask >= 16; mask -= 16) {
+            d_out_max[token_depth] = fmaxf(d_out_max[token_depth], __shfl_xor(d_out_max[token_depth], mask));
+        }
+        score_max = fmaxf(score_max, d_out_max[token_depth]);
     }
 
+    __shared__ float shared_score_max[NWARPS][GQA_RATIO];
+    if ((lane16id < GQA_RATIO) && (rowid == 0)) {
+        shared_score_max[warpid][lane16id] = score_max;
+    }
+    __syncthreads();
 
-    //softmax 
-    // qk score
-    __shared__ float shared_score[T_PAR_SIZE][GQA_RATIO];
-    __shared__ float shared_score_max[NUM_THREADS / WARP_SIZE][GQA_RATIO];
-    __shared__ float shared_score_sum[NUM_THREADS / WARP_SIZE][GQA_RATIO];
-
-    // local_max_score
-    float score_max[GQA_RATIO];
-    for (int gqa_idx = 0; gqa_idx < GQA_RATIO; gqa_idx++) {
-        if (is_valid_token) {
-            score_max[gqa_idx] = score[gqa_idx];
-        } else {
-            score_max[gqa_idx] = -FLT_MAX;
-        }
-
-        for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-            score_max[gqa_idx] = fmaxf(score_max[gqa_idx], __shfl_xor(score_max[gqa_idx], mask));
-        }
-        if (laneid == 0) {
-            shared_score_max[warpid][gqa_idx] = score_max[gqa_idx];
-        }
-        __syncthreads();
-        for (int i = 0; i < (NUM_THREADS / WARP_SIZE); i++){
-            score_max[gqa_idx] = fmaxf(score_max[gqa_idx], shared_score_max[i][gqa_idx]);
+    float partition_score_max = -FLT_MAX;
+    for (int nwarp = 0; nwarp < NWARPS; nwarp++) {
+        if (lane16id < GQA_RATIO) {
+            partition_score_max = fmaxf(partition_score_max, shared_score_max[nwarp][lane16id]);
         }
     }
+
+    float score_exp[4] = {};
+    float saved_exp[TLOOP][4]   = {};
+    float score_sum[TLOOP]      = {};
+    __shared__ float shared_score_sum[NWARPS][GQA_RATIO];
+
+    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+        for (int i = 0; i < 4; i++) {
+            const auto local_token_idx  = warpid * TOKENS_PER_WARP + token_depth * 16 + rowid * 4 + i;
+            const auto global_token_idx =  partition_start_token_idx + local_token_idx;
+            if (global_token_idx < context_len) {
+                score_exp[i] = __expf(d_out[token_depth][i] - partition_score_max);
+            } else {
+                score_exp[i] = 0.0f;
+            }
+            saved_exp[token_depth][i] = score_exp[i];
+            score_sum[token_depth] += score_exp[i];
+        }
+        for (int mask = QKHE_PER_FETCH; mask >= 16; mask -=16) {
+            score_sum[token_depth] = score_sum[token_depth] + __shfl_xor(score_sum[token_depth], mask);
+        }
+        if ((lane16id < GQA_RATIO) && (rowid == 0)) {
+            if (token_depth == 0) {
+                shared_score_sum[warpid][lane16id] = score_sum[token_depth];
+            } else {
+                shared_score_sum[warpid][lane16id] += score_sum[token_depth];
+            }
+        }
+    }
+    __syncthreads();
     
-    //exp(score - max)
-    float score_exp[GQA_RATIO];
-    for (int gqa_idx = 0; gqa_idx < GQA_RATIO; gqa_idx++) {
-        score_exp[gqa_idx] = __expf(score[gqa_idx] - score_max[gqa_idx]);
-        if (is_valid_token) {
-            shared_score[thread_idx][gqa_idx] = score_exp[gqa_idx];
-        } else {
-            shared_score[thread_idx][gqa_idx] = 0.0f;
-            score_exp[gqa_idx] = 0.0f;
+    float partition_score_sum = 0.0f;
+    for (int nwarp = 0; nwarp < NWARPS; nwarp++) {
+        if (lane16id < GQA_RATIO) {
+            partition_score_sum = partition_score_sum + shared_score_sum[nwarp][lane16id];
+        }
+    }
+
+    constexpr float k_softmax_sum_eps = 1e-6f;
+    __shared__ float shared_score[T_PAR_SIZE][GQA_RATIO];
+
+    const float inv_partition_sum = (lane16id < GQA_RATIO) ? 
+                                    __fdividef(1.f, partition_score_sum + k_softmax_sum_eps) : 0.f;
+    for (int tloop = 0; tloop < TLOOP; ++tloop) {
+        for (int i = 0; i < 4; ++i) {
+            const int local_token_idx = warpid * TOKENS_PER_WARP + tloop * 16 + rowid * 4 + i;
+            if (lane16id < GQA_RATIO) {
+                shared_score[local_token_idx][lane16id] = saved_exp[tloop][i] * inv_partition_sum;
+            }
         }
     }
     __syncthreads();
 
-    // sum_exp(score - max) -> shared memory
-    float score_sum[GQA_RATIO] = {};
-    for (int gqa_idx = 0; gqa_idx < GQA_RATIO; gqa_idx++) {
-        score_sum[gqa_idx] = 0.0f;
-        score_sum[gqa_idx] += score_exp[gqa_idx];
-        for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
-            score_sum[gqa_idx] =  score_sum[gqa_idx] + __shfl_xor(score_sum[gqa_idx], mask);
-        }
-        if (laneid == 0) {
-            shared_score_sum[warpid][gqa_idx] = score_sum[gqa_idx];
-        }
-        __syncthreads();
-        for (int i = 0; i < (NUM_THREADS / WARP_SIZE); i++) {
-            if (i != warpid) {
-                score_sum[gqa_idx] += shared_score_sum[i][gqa_idx];
-            }
-        }
+    // exp_sums [num_seqs, num_heads, max_num_partitions]
+    // max_logits [num_seqs, num_heads, max_num_partitions]
+    if ((lane16id < GQA_RATIO) && (warpid == 0) && (rowid == 0)) {
+        int gqa_idx = lane16id;
+        int global_head_idx = kv_head_idx * GQA_RATIO + gqa_idx;
+
+        int num_heads = gridDim.z * GQA_RATIO;
+        int max_num_partitions = gridDim.y;
+
+        int offset = seq_idx * num_heads * max_num_partitions +
+                global_head_idx * max_num_partitions + partition_idx;
+        exp_sums[offset] = partition_score_sum;
+        max_logits[offset] = partition_score_max;
     }
 
     for (int i = thread_idx; i < GQA_RATIO * HEAD_SIZE; i += NUM_THREADS) {
@@ -203,8 +235,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
             int token_global_idx = partition_start_token_idx + t;
             // 先检查边界，再读取block_tables
             float weight[vectorize_size] = {};
-            for (int s = 0; s < vectorize_size; s++){
-                weight[s] = shared_score[t + s][gqa_idx] / score_sum[gqa_idx];
+            for (int s = 0; s < vectorize_size; s++) {
+                weight[s] = shared_score[t + s][gqa_idx];
             }
             if (token_global_idx < context_len) {
                 int block_idx = token_global_idx / BLOCK_SIZE;
@@ -233,21 +265,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
         auto out_offset = seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
                           global_head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE + head_element;
         out[out_offset] = static_cast<output_t>(result);
-    }
-
-    // exp_sums [num_seqs, num_heads, max_num_partitions]
-    // max_logits [num_seqs, num_heads, max_num_partitions]
-    if (thread_idx < GQA_RATIO) {
-        int gqa_idx = thread_idx;
-        int global_head_idx = kv_head_idx * GQA_RATIO + gqa_idx;
-
-        int num_heads = gridDim.z * GQA_RATIO;
-        int max_num_partitions = gridDim.y;
-
-        int offset = seq_idx * num_heads * max_num_partitions +
-                global_head_idx * max_num_partitions + partition_idx;
-        exp_sums[offset] = score_sum[gqa_idx];
-        max_logits[offset] = score_max[gqa_idx];
     }
 }
 
