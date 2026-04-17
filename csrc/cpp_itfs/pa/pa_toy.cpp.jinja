@@ -1,0 +1,92 @@
+#include "pa_toy.cuh"
+
+#define FUNCTION_DEFINE                                 \
+    void {{func_name}}(void* out_ptr,                   \
+                      void* exp_sums_ptr_,              \
+                      void* max_logits_ptr_,            \
+                      void* tmp_out_ptr_,               \
+                      void* query_ptr,                  \
+                      void* key_cache_ptr,              \
+                      void* value_cache_ptr,            \
+                      const float scale,                \
+                      int* block_tables_ptr,            \
+                      int* context_lens_ptr,            \
+                      const int max_context_len,        \
+                      const int num_seqs,               \
+                      const int num_kv_heads,           \
+                      const int num_heads,              \
+                      const int max_num_blocks_per_seq, \
+                      const int q_stride,               \
+                      const int kv_block_stride,        \
+                      const int kv_head_stride,         \
+                      void* stream)
+
+extern "C" {
+FUNCTION_DEFINE;
+}
+
+FUNCTION_DEFINE
+{
+    constexpr int PARTITION_SIZE = 256;
+
+    const int max_num_partitions =
+        DIVIDE_ROUND_UP(max_context_len, PARTITION_SIZE);
+    constexpr int head_size = {{head_size}};
+
+    float* exp_sums_ptr   = reinterpret_cast<float*>(exp_sums_ptr_);
+    float* max_logits_ptr = reinterpret_cast<float*>(max_logits_ptr_);
+    {{out_dtype}}* tmp_out_ptr = reinterpret_cast<{{out_dtype}}*>(tmp_out_ptr_);
+
+    constexpr int NTHR = 256;
+    dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+    dim3 block(NTHR);
+
+    paged_attention_ll4mi_QKV_mfma16_kernel_toy<
+        {{dtype}},
+        {{out_dtype}},
+        {{kv_dtype}},
+        vllm::Fp8KVCacheDataType::kAuto,
+        {{block_size}},
+        head_size,
+        NTHR,
+        false,       // ALIBI_ENABLED
+        {{gqa_ratio}},
+        1,           // MTP
+        vllm::Fp8QuantMethod::kPerTensor,
+        true>        // V_SHUFFLE
+    <<<grid, block, 0, reinterpret_cast<hipStream_t>(stream)>>>(
+        reinterpret_cast<{{dtype}}*>(query_ptr),
+        reinterpret_cast<{{kv_dtype}}*>(key_cache_ptr),
+        reinterpret_cast<{{kv_dtype}}*>(value_cache_ptr),
+        scale,
+        block_tables_ptr,
+        context_lens_ptr,
+        nullptr,
+        max_num_blocks_per_seq,
+        nullptr,     // alibi_slopes
+        q_stride,
+        kv_block_stride,
+        kv_head_stride,
+        exp_sums_ptr,
+        max_logits_ptr,
+        tmp_out_ptr,
+        nullptr,     // q_scale
+        nullptr,     // k_scale
+        nullptr);    // v_scale
+
+    dim3 reduce_grid(num_heads, num_seqs);
+    dim3 reduce_block(head_size);
+    paged_attention_ll4mi_reduce_kernel_toy<
+        {{out_dtype}},
+        {{out_dtype}},
+        head_size,
+        head_size,
+        PARTITION_SIZE>
+    <<<reduce_grid, reduce_block, 0, reinterpret_cast<hipStream_t>(stream)>>>(
+        reinterpret_cast<{{out_dtype}}*>(out_ptr),
+        exp_sums_ptr,
+        max_logits_ptr,
+        tmp_out_ptr,
+        context_lens_ptr,
+        max_num_partitions);
+}

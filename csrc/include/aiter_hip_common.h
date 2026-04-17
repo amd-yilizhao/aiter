@@ -240,13 +240,18 @@ static uint32_t get_num_cu_func()
     return num_cu;
 }
 
+#ifndef __HIP_DEVICE_COMPILE__
 static int get_pci_chip_id()
 {
     static const int chip_id = []() {
         hipDevice_t dev;
         int id = 0;
         HIP_CALL(hipGetDevice(&dev));
+#if defined(hipDeviceAttributePciChipId)
         HIP_CALL(hipDeviceGetAttribute(&id, hipDeviceAttributePciChipId, dev));
+#else
+        HIP_CALL(hipDeviceGetAttribute(&id, hipDeviceAttributePciBusId, dev));
+#endif
         AITER_LOG_INFO("pciChipId: 0x" << std::hex << id << std::dec
                                        << ", CU count: " << get_num_cu_func());
         return id;
@@ -259,6 +264,7 @@ static bool is_mi308_device()
     int chip_id = get_pci_chip_id();
     return chip_id == 0x74a2 || chip_id == 0x74a8 || chip_id == 0x74b6 || chip_id == 0x74bc;
 }
+#endif  // __HIP_DEVICE_COMPILE__
 
 class HipDeviceGuard {
 public:
