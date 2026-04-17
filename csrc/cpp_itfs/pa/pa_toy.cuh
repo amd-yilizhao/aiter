@@ -4,7 +4,6 @@
 #include "float.h"
 #include "hip_compat.h"
 #include "pa_common.cuh"
-#include "pa_kernels.cuh"
 #include "quant_utils.cuh"
 #include <algorithm>
 #include <hip/hip_bf16.h>
@@ -75,6 +74,9 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
         return;
     }
 
+    const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
+    const int last_ctx_block     = num_context_blocks - 1;
+
     // load q from global to shared memory
     constexpr int Q_VEC_SIZE = 16 / sizeof(scalar_t);
     __shared__ _B16x8 shared_q[GQA_RATIO][HEAD_SIZE / Q_VEC_SIZE];
@@ -102,7 +104,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
     // load k -> reg && Q*K
     _B16x8 Klocal[TLOOP][QKHELOOP] = {};
     floatx4 d_out[TLOOP] = {};
-    float d_out_max[TLOOP] = -FLT_MAX;
+    float d_out_max[TLOOP];
+    for (int t = 0; t < TLOOP; t++) d_out_max[t] = -FLT_MAX;
     float score_max = -FLT_MAX;
 
     constexpr int K_VEC_SIZE = CONTIGUOUS_KV_ELEMS_16B_LOAD;
@@ -117,8 +120,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
         const auto block_table_element = global_token_idx % BLOCK_SIZE;
 
         // 避免越界
-        const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
-        const int safe_block_idx = is_valid_token ? block_table_idx : (num_context_blocks - 1);
+        const int safe_block_idx = is_valid_token ? block_table_idx : last_ctx_block;
         const auto block_table_offset = seq_idx * max_num_blocks_per_seq + safe_block_idx;
         const auto physical_block_num = block_tables[block_table_offset];
 
@@ -226,45 +228,67 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
         max_logits[offset] = partition_score_max;
     }
 
-    for (int i = thread_idx; i < GQA_RATIO * HEAD_SIZE; i += NUM_THREADS) {
-        int gqa_idx      = i / HEAD_SIZE;
-        int head_element = i % HEAD_SIZE;
-        
-        float result = 0;
-        for (int t = 0; t < T_PAR_SIZE; t += vectorize_size) {
-            int token_global_idx = partition_start_token_idx + t;
-            // 先检查边界，再读取block_tables
-            float weight[vectorize_size] = {};
-            for (int s = 0; s < vectorize_size; s++) {
-                weight[s] = shared_score[t + s][gqa_idx];
-            }
-            if (token_global_idx < context_len) {
-                int block_idx = token_global_idx / BLOCK_SIZE;
-                int block_element = token_global_idx % BLOCK_SIZE;
-                int global_block_idx = seq_idx * max_num_blocks_per_seq + block_idx;
-                int global_block_num = block_tables[global_block_idx];
+    //Load V to reg && PV MFMA
+    constexpr auto VHELOOP = HEAD_SIZE / 16 / NWARPS;
+    constexpr auto VTLOOP = T_PAR_SIZE / TOKENS_PER_WARP;
+    constexpr auto VTLANELOOP = TOKENS_PER_WARP / ROWS_PER_WARP / CONTIGUOUS_KV_ELEMS_16B_LOAD;
 
+    constexpr int VTOKENS_PER_LANE = TOKENS_PER_WARP / ROWS_PER_WARP; // 64 / 4 = 16
+
+    for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+        _B16x8 Vlocal[VTLOOP][VTLANELOOP];
+        const int vhead_elem = vhe_depth * 64 + warpid * 16 + lane16id;
+        floatx4 tmp_out = {0};
+    
+        for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
+            for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++){
+                const auto vlocal_token_idx  = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
+                                              rowid * VTOKENS_PER_LANE + vfetch_depth * 8;
+                const auto vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
+
+                const auto block_table_idx     = vglobal_token_idx / BLOCK_SIZE;
+                const auto block_table_element = vglobal_token_idx % BLOCK_SIZE;
+
+                const int safe_block_idx = (vglobal_token_idx < context_len) ? 
+                                                    block_table_idx : last_ctx_block;
+
+                const auto block_table_offset = seq_idx * max_num_blocks_per_seq + safe_block_idx;
+                const auto v_physical_block_num = block_tables[block_table_offset];
+                
                 // v_cache [num_blocks, num_kv_heads, block_size/x, head_size, x]
-                const cache_t* v_ptr = v_cache + 
-                                        global_block_num * kv_block_stride +
-                                        kv_head_idx * kv_head_stride +
-                                        block_element / vectorize_size * HEAD_SIZE * vectorize_size +
-                                        head_element * vectorize_size;
-                const _B16x8 v_value = *reinterpret_cast<const _B16x8*>(v_ptr);
-                for (int k = 0; k < 2; k++) {
-                    for (int j = 0; j < 4; j++) {
-                        result += weight[k*4+j] * float(v_value.xy[k][j]);
-                    }
+                const cache_t* v_ptr = v_cache +
+                                       v_physical_block_num * kv_block_stride +
+                                       kv_head_idx * kv_head_stride +
+                                       block_table_element / vectorize_size * HEAD_SIZE * vectorize_size +
+                                       vhead_elem * vectorize_size;
+ 
+                Vlocal[vtoken_depth][vfetch_depth] = *reinterpret_cast<const _B16x8*>(v_ptr);
+
+                for (int i = 0; i < 2; i++) {
+                    const auto p_offset = vtoken_depth * 64 + rowid * 16 + vfetch_depth * 8 + i * 4;
+                    floatx4 p_floats = {shared_score[p_offset + 0][lane16id], shared_score[p_offset + 1][lane16id],
+                                        shared_score[p_offset + 2][lane16id], shared_score[p_offset + 3][lane16id]};
+                    const auto p_weight = from_floatx4<scalar_t>(p_floats);
+                    tmp_out = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(Vlocal[vtoken_depth][vfetch_depth].xy[i], p_weight, tmp_out);
                 }
             }
         }
-        int global_head_idx = kv_head_idx * GQA_RATIO + gqa_idx;
-        int num_heads = gridDim.z * GQA_RATIO;
-        int max_num_partitions = gridDim.y;
-        // out[num_seqs, num_heads, max_num_partitions, head_size]
-        auto out_offset = seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
-                          global_head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE + head_element;
-        out[out_offset] = static_cast<output_t>(result);
+
+        if (lane16id < GQA_RATIO) {
+            int global_head_idx = kv_head_idx * GQA_RATIO + lane16id;
+            int num_heads = gridDim.z * GQA_RATIO;
+            int max_num_partitions = gridDim.y;
+
+            for (int idx = 0; idx < 4; idx++) {
+                const auto o_head_elem = vhe_depth * 64 + warpid * 16 + rowid * 4 + idx;
+
+                // out[num_seqs, num_heads, max_num_partitions, head_size]
+                auto out_offset = seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
+                              global_head_idx * max_num_partitions * HEAD_SIZE +
+                              partition_idx * HEAD_SIZE + o_head_elem;
+                out[out_offset] =  static_cast<output_t>(tmp_out[idx]);
+            }
+        }
     }
 }
 
@@ -311,7 +335,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
                              __expf(max_logits[max_logits_base_offset + num_partition] - global_max);
             float weight = sum_p / global_sum;
 
-            result += weight * tmp_out[tmp_out_value_offset];
+            result += weight * (float)tmp_out[tmp_out_value_offset];
         }
         int out_offset = seq_idx * gridDim.x * HEAD_SIZE + head_idx * HEAD_SIZE + head_element;
         out[out_offset] = static_cast<OUTT>(result);
