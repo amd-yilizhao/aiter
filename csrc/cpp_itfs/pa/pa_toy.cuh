@@ -112,18 +112,9 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
         }
     }
 
-    // load k -> reg && Q*K
-    _B16x8 Klocal[HEAD_LOOP][TLOOP][QKHELOOP] = {};
-    floatx4 d_out[GQA_RATIO_LOOP][TLOOP] = {};
-    float d_out_max[GQA_RATIO_LOOP][TLOOP];
-    float score_max[GQA_RATIO_LOOP];
-    for (int gr = 0; gr < GQA_RATIO_LOOP; gr++) {
-        score_max[gr] = -FLT_MAX;
-        for (int t = 0; t < TLOOP; t++) d_out_max[gr][t] = -FLT_MAX;
-    }
-
+    // load k global -> reg
     constexpr int K_VEC_SIZE = CONTIGUOUS_KV_ELEMS_16B_LOAD;
-
+    _B16x8 Klocal[HEAD_LOOP][TLOOP][QKHELOOP] = {};
     for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
         const auto local_token_idx = TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
         const auto global_token_idx = partition_start_token_idx + local_token_idx;
@@ -133,7 +124,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
         const auto block_table_idx = global_token_idx / BLOCK_SIZE;
         const auto block_table_element = global_token_idx % BLOCK_SIZE;
 
-        // 避免越界
         const int safe_block_idx = is_valid_token ? block_table_idx : last_ctx_block;
         const auto block_table_offset = seq_idx * max_num_blocks_per_seq + safe_block_idx;
         const auto physical_block_num = block_tables[block_table_offset];
@@ -143,11 +133,64 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
                 // k_cache [num_blocks, num_kv_heads, head_size/x, block_size, x]
                 const int head_element = head_loop * HEAD_SIZE_PER_LOOP +
                                          qkhe_depth * QKHE_PER_FETCH + rowid * K_VEC_SIZE;
-                Klocal[head_loop][token_depth][qkhe_depth] = *reinterpret_cast<const _B16x8*>(k_cache +
-                    physical_block_num * kv_block_stride +
-                    kv_head_idx * kv_head_stride +
-                    head_element / K_VEC_SIZE * BLOCK_SIZE * K_VEC_SIZE +
-                    block_table_element * K_VEC_SIZE);
+                Klocal[head_loop][token_depth][qkhe_depth] = *reinterpret_cast<const _B16x8*>(
+                                                                k_cache +
+                                                                physical_block_num * kv_block_stride +
+                                                                kv_head_idx * kv_head_stride +
+                                                                head_element / K_VEC_SIZE * BLOCK_SIZE * K_VEC_SIZE +
+                                                                block_table_element * K_VEC_SIZE);
+            }
+        }
+    }
+
+    // load v global -> reg
+    constexpr auto VHELOOP = HEAD_SIZE / 16 / NWARPS;
+    constexpr auto VTLOOP = T_PAR_SIZE / TOKENS_PER_WARP;
+    constexpr auto VTLANELOOP = TOKENS_PER_WARP / ROWS_PER_WARP / CONTIGUOUS_KV_ELEMS_16B_LOAD;
+    constexpr int VTOKENS_PER_LANE = TOKENS_PER_WARP / ROWS_PER_WARP;
+
+    _B16x8 Vlocal[VTLOOP][VHELOOP][VTLANELOOP];
+    for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
+        for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
+            const int vhead_elem = vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
+
+            for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++) {
+                const auto vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
+                                              rowid * VTOKENS_PER_LANE + vfetch_depth * 8;
+                const auto vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
+
+                const auto block_table_idx     = vglobal_token_idx / BLOCK_SIZE;
+                const auto block_table_element = vglobal_token_idx % BLOCK_SIZE;
+
+                const int safe_block_idx =
+                    (vglobal_token_idx < context_len) ? block_table_idx : last_ctx_block;
+
+                const auto block_table_offset = seq_idx * max_num_blocks_per_seq + safe_block_idx;
+                const auto v_physical_block_num = block_tables[block_table_offset];
+
+                const cache_t* v_ptr = v_cache +
+                                       v_physical_block_num * kv_block_stride +
+                                       kv_head_idx * kv_head_stride +
+                                       block_table_element / vectorize_size * HEAD_SIZE * vectorize_size +
+                                       vhead_elem * vectorize_size;
+
+                Vlocal[vtoken_depth][vhe_depth][vfetch_depth] = *reinterpret_cast<const _B16x8*>(v_ptr);
+            }
+        }
+    }
+
+    // Q*K
+    floatx4 d_out[GQA_RATIO_LOOP][TLOOP] = {};
+    float d_out_max[GQA_RATIO_LOOP][TLOOP];
+    float score_max[GQA_RATIO_LOOP];
+    for (int gr = 0; gr < GQA_RATIO_LOOP; gr++) {
+        score_max[gr] = -FLT_MAX;
+        for (int t = 0; t < TLOOP; t++) d_out_max[gr][t] = -FLT_MAX;
+    }
+
+    for (int token_depth = 0; token_depth < TLOOP; token_depth++) {
+        for (int head_loop = 0; head_loop < HEAD_LOOP; head_loop++) {
+            for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
                 for (int gr = 0; gr < GQA_RATIO_LOOP; gr++) {
                     for (int i = 0; i < 2; i++) {
                         d_out[gr][token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
@@ -279,41 +322,12 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
         }
     }
 
-    //Load V to reg && PV MFMA
-    constexpr auto VHELOOP = HEAD_SIZE / 16 / NWARPS;
-    constexpr auto VTLOOP = T_PAR_SIZE / TOKENS_PER_WARP;
-    constexpr auto VTLANELOOP = TOKENS_PER_WARP / ROWS_PER_WARP / CONTIGUOUS_KV_ELEMS_16B_LOAD;
-
-    constexpr int VTOKENS_PER_LANE = TOKENS_PER_WARP / ROWS_PER_WARP;
-
+    //P*V
     for (int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++) {
-        _B16x8 Vlocal[VTLOOP][VTLANELOOP];
-        const int vhead_elem = vhe_depth * NWARPS * 16 + warpid * 16 + lane16id;
 
         floatx4 tmp_out[GQA_RATIO_LOOP] = {};
         for (int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++) {
             for (int vfetch_depth = 0; vfetch_depth < VTLANELOOP; vfetch_depth++) {
-                const auto vlocal_token_idx = vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
-                                              rowid * VTOKENS_PER_LANE + vfetch_depth * 8;
-                const auto vglobal_token_idx = partition_start_token_idx + vlocal_token_idx;
-
-                const auto block_table_idx     = vglobal_token_idx / BLOCK_SIZE;
-                const auto block_table_element = vglobal_token_idx % BLOCK_SIZE;
-
-                const int safe_block_idx =
-                    (vglobal_token_idx < context_len) ? block_table_idx : last_ctx_block;
-
-                const auto block_table_offset = seq_idx * max_num_blocks_per_seq + safe_block_idx;
-                const auto v_physical_block_num = block_tables[block_table_offset];
-
-                const cache_t* v_ptr = v_cache +
-                                       v_physical_block_num * kv_block_stride +
-                                       kv_head_idx * kv_head_stride +
-                                       block_table_element / vectorize_size * HEAD_SIZE * vectorize_size +
-                                       vhead_elem * vectorize_size;
-
-                Vlocal[vtoken_depth][vfetch_depth] = *reinterpret_cast<const _B16x8*>(v_ptr);
-
                 for (int i = 0; i < 2; i++) {
                     const auto p_offset = vtoken_depth * TOKENS_PER_WARP + rowid * VTOKENS_PER_LANE +
                                           vfetch_depth * 8 + i * 4;
@@ -326,7 +340,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel_toy(
                                                                    : floatx4{0.f, 0.f, 0.f, 0.f};
                         const auto p_weight = from_floatx4<scalar_t>(p_floats);
                         tmp_out[gr] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                            Vlocal[vtoken_depth][vfetch_depth].xy[i], p_weight, tmp_out[gr]);
+                            Vlocal[vtoken_depth][vhe_depth][vfetch_depth].xy[i], p_weight, tmp_out[gr]);
                     }
                 }
             }
